@@ -9,7 +9,7 @@
     GET  /tools         工具列表（JSON schema）
     POST /mcp           MCP JSON-RPC（initialize / tools/list / tools/call）
     POST /mcp/causal    兼容路径
-    GET  /jobs/<id>     异步任务状态/结果（当前 4 个工具均为同步秒级，预留）
+    GET  /jobs/<id>     异步任务状态/结果（当前 8 个工具均为同步秒级，预留）
     GET  /quota         当前 license key 的额度余量（鉴权模式）
     GET  /queue-stats   队列概况
 
@@ -37,7 +37,7 @@ SERVER_NAME = "causal-mcp"
 VERSION = "1.0.0"
 
 # 重负载工具：提交后入异步队列执行（返回 job_id 轮询），不占 HTTP 连接。
-# 当前 4 个工具均为秒级同步调用，此集合为空；后续若接入全量 DoWhy/
+# 当前 8 个工具均为秒级同步调用，此集合为空；后续若接入全量 DoWhy/
 # 大图 NOTEARS 等重负载，把工具名加进来即可。
 ASYNC_TOOLS: set[str] = set()
 

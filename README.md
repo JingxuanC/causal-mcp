@@ -10,7 +10,7 @@ Agent）都能直接做「事件研究 → 反事实验证 → 因果图学习�
 公网服务提供托管的多租户 + license 额度体系，本项目也内置了同一套
 `mcp_gateway.py` 鉴权/额度模块供私有化部署选用。
 
-## 工具清单（4 个）
+## 工具清单（8 个）
 
 | 工具 | 说明 | 负载 |
 |------|------|------|
@@ -18,8 +18,12 @@ Agent）都能直接做「事件研究 → 反事实验证 → 因果图学习�
 | `event_study_batch` | 批量事件研究：多事件一次提交，子进程 stdin/stdout JSON 执行（与 Athena Go causal engine 调用方式一致） | 中（同步，120s 超时） |
 | `refute` | 反事实验证三件套：placebo_treatment / random_common_cause / data_subset，输出逐项 robust/refuted + 总体评级 A-F。DoWhy 方法论的纯 numpy 自包含实现，**无需安装 dowhy** | 轻（同步） |
 | `learn_graph` | 因果图结构学习：`pc`（偏相关 + Fisher z 检验，纯 numpy/scipy）或 `notears`（Ridge 简化版，未装 sklearn 时自动降级为相关性边） | 轻（同步） |
+| `causal_impact` | 事件反事实影响评估（对标 Google CausalImpact 的 BSTS）：默认纯 numpy OLS 对冲回归外推反事实 + 经验 p 值 + 95% 区间；装了 pycausalimpact 自动走真 BSTS | 轻（同步） |
+| `granger_te` | 两序列 lead-lag 因果：statsmodels Granger F 检验（双向逐滞后）+ 纯 numpy 传递熵（分位数分箱，双向） | 轻（同步） |
+| `pcmci_discover` | 多变量时序因果发现（带滞后边）：装了 tigramite 走真 PCMCI（ParCorr）；未装自动降级为纯 numpy lagged 条件偏相关筛选 | 轻（同步） |
+| `dml_cate` | 异质处理效应（CATE）：装了 econml 走 LinearDML；未装自动降级为 sklearn T-learner（GBRT 双模型预测差）+ 特征重要性 | 轻（同步） |
 
-4 个工具均为秒级同步调用，直接返回结果。server 内置异步任务队列
+8 个工具均为秒级同步调用，直接返回结果。server 内置异步任务队列
 （`mcp_gateway.py` JobQueue），后续接入重负载工具时无需改架构。
 
 ## 快速开始
@@ -118,16 +122,115 @@ CAR 全窗口绝对值 < 0.005 时直接跳过（事件影响可忽略，无因�
 返回 `{"edges": [{"from", "to", "weight", "direction"}], "nodes": [...],
 "metrics": {"n_edges", "sparsity", "avg_weight"}}`。至少 2 列 5 行数据。
 
+### causal_impact — 事件反事实影响评估
+
+```json
+{"symbol": "002371", "event_date": "2026-04-17",
+ "klines": [{"date": "2026-01-05", "close": 100.0}, ...],
+ "benchmark": [{"date": "2026-01-05", "close": 3200.0}, ...]}
+```
+
+事件日前为估计窗、事件日起为影响窗。返回：
+
+```json
+{"cumulative_impact": 0.319, "avg_daily_impact": 0.029, "p_value": 0.0,
+ "ci_95": [0.284, 0.367], "significant": true, "method": "bsts",
+ "alpha": -0.0009, "beta": 1.13, "r_squared": 0.66, "n_pre": 59, "n_post": 11}
+```
+
+`method` 标注实际实现：`"bsts"`（装了 pycausalimpact，走 Google CausalImpact
+同款贝叶斯结构时序）或 `"ols_hedge"`（fallback：事件前窗口 OLS 对冲回归
+外推反事实，经验 p 值为事件前残差同长度滚动窗口累计的双侧置换分位）。
+
+### granger_te — 两序列 lead-lag 因果
+
+```json
+{"x": [0.001, -0.002, ...], "y": [0.002, 0.001, ...], "max_lag": 5}
+```
+
+输入收益率序列。返回：
+
+```json
+{"granger": {"x_causes_y": {"best_lag": 2, "p_value": 0.0, "p_by_lag": {...}},
+             "y_causes_x": {"best_lag": 1, "p_value": 0.72, "p_by_lag": {...}}},
+ "transfer_entropy": {"x_to_y": 0.76, "y_to_x": 0.84},
+ "lead_lag": "x_leads"}
+```
+
+Granger 用 statsmodels `grangercausalitytests` 双向 F 检验；传递熵为纯 numpy
+分位数分箱实现。`lead_lag`：单向显著取该侧，双向显著取 p 更小侧，均不显著
+时看 TE 相对强弱（>20% 差），否则 `"none"`。
+
+### pcmci_discover — 多变量时序因果发现
+
+```json
+{"data": {"columns": ["X1", "X2", "X3"], "rows": [[...], ...]},
+ "max_lag": 3, "alpha": 0.05}
+```
+
+返回 `{"edges": [{"from", "to", "lag", "strength", "p_value"}], "method": ...}`。
+`method` 为 `"pcmci"`（装了 tigramite，ParCorr 条件独立检验）或
+`"granger_fallback"`（纯 numpy：对每对变量、每个滞后做 MCI 风格条件偏相关
++ Fisher z 检验，条件集 = 目标自身滞后 + 其他变量全部滞后）。
+
+### dml_cate — 异质处理效应
+
+```json
+{"treatment": [1, 0, 1, ...], "outcome": [0.03, -0.01, ...],
+ "features": {"feature_A": [...], "feature_B": [...]}}
+```
+
+面板数据：treatment 为事件哑变量或因子暴露（非二元自动按中位数二分，
+输出标注 `treatment_binarized`），outcome 如事件后前瞻收益，features 为
+标的属性。返回：
+
+```json
+{"cate_summary": {"mean": 0.014, "std": 0.014, "top_decile_mean": 0.040,
+                  "bottom_decile_mean": -0.010},
+ "feature_importance": [{"feature": "feature_A", "importance": 0.95}, ...],
+ "method": "dml", "n": 600, "n_treated": 293, "n_control": 307}
+```
+
+`method` 为 `"dml"`（装了 econml，LinearDML 双重机器学习）或 `"t_learner"`
+（sklearn GradientBoosting 双模型预测差）。top/bottom 十分位 CATE 差异 +
+特征重要性排序用于识别"哪类标的对处理反应更强"。
+
 ## 依赖说明
 
-必需：`numpy` `scipy` `pandas`（纯科学计算栈，无 qlib/redis/DB）。
+必需：`numpy` `scipy` `pandas` `statsmodels` `scikit-learn`
+（纯科学计算栈，无 qlib/redis/DB）。
 
-可选（全部惰性导入，未装不影响服务启动）：
+可选（全部惰性导入，未装不影响服务启动，有 fallback 的工具自动降级并在
+返回的 `method` 字段标注实际实现）：
 
-- `scikit-learn` — `learn_graph` 的 `method="notears"` 路径；未装自动降级
+- `pycausalimpact` — `causal_impact` 的真 BSTS 路径（Google CausalImpact
+  的 Python 移植）；未装走 OLS 对冲回归 fallback（`method="ols_hedge"`）
+- `tigramite` — `pcmci_discover` 的真 PCMCI 路径；未装走纯 numpy lagged
+  条件偏相关 fallback（`method="granger_fallback"`）
+- `econml` — `dml_cate` 的 LinearDML 路径；未装走 sklearn T-learner
+  fallback（`method="t_learner"`）
 - `dowhy` / `networkx` — 完整 DoWhy 反事实管线。本项目的 `refute` 是
   DoWhy 三种 refuter 方法论的纯 numpy 自包含实现，不依赖 dowhy 包
-- `statsmodels` — OLS 诊断参考；当前事件研究用 numpy lstsq + scipy t 检验
+
+## 方法学出处
+
+- **事件研究 / OLS 对冲**：市场模型（Sharpe 1964）；CausalImpact fallback
+  沿用同框架外推反事实
+- **CausalImpact (BSTS)**：Brodersen et al., "Inferring causal impact using
+  Bayesian structural time-series models", *Annals of Applied Statistics*,
+  2015（Google）；Python 移植 [pycausalimpact](https://github.com/WillianFuks/tfcausalimpact)
+- **Granger 因果**：Granger, "Investigating causal relations by econometric
+  models and cross-spectral methods", *Econometrica*, 1969（statsmodels 实现）
+- **传递熵**：Schreiber, "Measuring information transfer", *Physical Review
+  Letters* 85(2), 2000（本项目为分位数分箱的纯 numpy 实现）
+- **PCMCI**：Runge et al., "Detecting and quantifying causal associations in
+  large nonlinear time series datasets", *Science Advances* 5(11), 2019
+  （[tigramite](https://github.com/jakobrunge/tigramite) 实现；fallback 为
+  同思想的条件偏相关保守版）
+- **DML / CATE**：Chernozhukov et al., "Double/debiased machine learning for
+  treatment and structural parameters", *Econometrics Journal* 21(1), 2018
+  （[EconML](https://github.com/py-why/EconML) LinearDML；fallback 为
+  sklearn T-learner）
 
 ## 鉴权与额度（可选）
 
@@ -164,6 +267,18 @@ GET  /queue-stats   队列概况
   数据子集（50 次 70% bootstrap 方向一致性）
 - **因果图**：PC 算法从全连接图出发，用偏相关 + Fisher z 检验按条件集
   大小（≤3）迭代删除条件独立边；NOTEARS 为 Ridge 回归简化版
+- **因果影响**：fallback 用事件前窗口对基准收益做 OLS 对冲回归，外推
+  事件后反事实，经验 p 值为事件前残差同长度滚动窗口累计的双侧置换分位，
+  95% 区间按 σ·√N·√(1+1/n_pre) 含外推不确定性；BSTS 路径直接取
+  pycausalimpact 的 post_cum_effects 与 p_value
+- **lead-lag**：Granger 双向 F 检验取逐滞后最小 p；传递熵按分位数 8 分箱
+  离散化后计算条件概率比的对数和
+- **时序因果发现**：fallback 对每对变量每个滞后做 MCI 风格条件偏相关
+  （条件集 = 目标自身滞后 + 其他变量全部滞后）+ Fisher z；PCMCI 路径用
+  tigramite ParCorr
+- **异质效应**：T-learner 对处理/对照组各拟合 GradientBoosting，同一样本
+  预测差为 CATE，特征重要性取两模型均值；DML 路径用 econml LinearDML，
+  重要性取 |coef| 归一化
 
 ## 致谢
 

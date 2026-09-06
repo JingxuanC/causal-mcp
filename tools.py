@@ -1,4 +1,4 @@
-"""tools.py — A股因果分析 MCP 的工具注册表（4 个工具）。
+"""tools.py — A股因果分析 MCP 的工具注册表（8 个工具）。
 
 从 Athena py-sidecar 抽取 causal 域子集：
 - event_study / event_study_batch：事件研究（市场模型 OLS + CAR + t 检验）
@@ -6,8 +6,17 @@
   DoWhy 方法论的纯 numpy 自包含实现，不依赖 dowhy 包）
 - learn_graph：因果图结构学习（PC 算法纯 numpy/scipy；NOTEARS 路径
   惰性 import sklearn，未装时自动降级为相关性边）
+- causal_impact：事件反事实影响评估（默认 OLS 对冲回归纯 numpy；装了
+  pycausalimpact 时惰性 import 走真 BSTS，method 字段标注实际实现）
+- granger_te：两序列 lead-lag（statsmodels Granger F 检验 + 纯 numpy
+  传递熵，Schreiber 2000）
+- pcmci_discover：多变量时序因果发现（默认纯 numpy lagged 条件偏相关
+  筛选；装了 tigramite 时走真 PCMCI，Runge et al. 2019）
+- dml_cate：异质处理效应（默认 sklearn T-learner；装了 econml 时走
+  LinearDML，Chernozhukov et al. 2018）
 
-重依赖全部惰性导入：未装 sklearn 也可启动服务并正常调用全部工具。
+重依赖全部惰性导入：未装 statsmodels/sklearn/tigramite/econml/pycausalimpact
+也可启动服务；有 fallback 的工具自动降级并在 method 字段标注。
 """
 
 from __future__ import annotations
@@ -181,6 +190,114 @@ def learn_graph(data: dict, method: str = "pc", alpha: float = 0.05) -> str:
                            "hint": "pip install numpy scipy pandas"})
     return json.dumps(_impl({"data": data, "method": method, "alpha": alpha}),
                       ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 事件反事实影响评估（OLS 对冲 fallback / BSTS 增强）
+# ═══════════════════════════════════════════════════════════════
+
+@tool("causal_impact", "事件反事实影响评估（对标 Google CausalImpact 的 BSTS）："
+      "用事件前窗口对基准收益做 OLS 对冲回归（市场模型），外推事件后反事实收益，"
+      "实际-反事实残差 → 累计影响 + 经验 p 值（事件前残差同长度滚动窗口的双侧置换分位）"
+      "+ 95% 区间。装了 pycausalimpact 时自动走真 BSTS（Brodersen et al. 2015，惰性 import，"
+      "失败降级）。返回 JSON: {cumulative_impact, avg_daily_impact, p_value, ci_95, "
+      "significant, method: 'ols_hedge'|'bsts', alpha, beta, r_squared, ...}。",
+      {"symbol": {"type": "string", "description": "股票代码，如 002371 / sh600519"},
+       "event_date": {"type": "string", "description": "事件日期 YYYY-MM-DD（该日起为事件后窗口）"},
+       "klines": _KLINES_SCHEMA,
+       "benchmark": {**_KLINES_SCHEMA,
+                     "description": "市场基准（指数）日K线，与 klines 对齐；缺失按零收益处理"}},
+      required=["symbol", "event_date", "klines"])
+def causal_impact(symbol: str, event_date: str, klines: list,
+                  benchmark: Optional[list] = None) -> str:
+    try:
+        from causal_impact import causal_impact as _impl
+    except ImportError as e:
+        return json.dumps({"error": f"causal_impact dependency missing: {e}",
+                           "hint": "pip install numpy pandas"})
+    return json.dumps(_impl(symbol, event_date, klines, benchmark or []), ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 两序列 lead-lag 因果（Granger + 传递熵）
+# ═══════════════════════════════════════════════════════════════
+
+@tool("granger_te", "两序列 lead-lag 因果分析：statsmodels Granger 因果 F 检验"
+      "（双向，逐滞后阶 p 值）+ 纯 numpy 传递熵（Schreiber 2000，分位数分箱，双向）。"
+      "输入收益率序列。返回 JSON: {granger: {x_causes_y: {best_lag, p_value, p_by_lag}, "
+      "y_causes_x: {...}}, transfer_entropy: {x_to_y, y_to_x}, lead_lag: "
+      "'x_leads'|'y_leads'|'none'}。依赖 statsmodels（requirements 必需项）。",
+      {"x": {"type": "array", "items": {"type": "number"},
+             "description": "序列 X（如基准/领先者收益率，按时间升序）"},
+       "y": {"type": "array", "items": {"type": "number"},
+             "description": "序列 Y（与 X 等长）"},
+       "max_lag": {"type": "integer", "default": 5,
+                   "description": "最大滞后阶（默认 5）"}},
+      required=["x", "y"])
+def granger_te(x: list, y: list, max_lag: int = 5) -> str:
+    try:
+        from granger_te import granger_te as _impl
+    except ImportError as e:
+        return json.dumps({"error": f"granger_te dependency missing: {e}",
+                           "hint": "pip install numpy scipy statsmodels"})
+    return json.dumps(_impl(x, y, max_lag), ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 多变量时序因果发现（lagged 偏相关 fallback / PCMCI 增强）
+# ═══════════════════════════════════════════════════════════════
+
+@tool("pcmci_discover", "多变量时序因果发现（带滞后边）：装了 tigramite 时走真 PCMCI"
+      "（Runge et al., Science Advances 2019，ParCorr 条件独立检验，惰性 import）；"
+      "未装时自动降级为纯 numpy 的 lagged 条件偏相关筛选（对每对变量、每个滞后做 "
+      "MCI 风格偏相关 + Fisher z 检验，method='granger_fallback'）。"
+      "返回 JSON: {edges: [{from, to, lag, strength, p_value}], method, n, max_lag, alpha}。",
+      {"data": {"type": "object",
+                "description": "表格数据: {columns: ['x1', 'x2', ...], rows: [[...], ...]}，"
+                               "行按时间升序（收益率或标准化序列）",
+                "properties": {
+                    "columns": {"type": "array", "items": {"type": "string"}},
+                    "rows": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
+                },
+                "required": ["columns", "rows"]},
+       "max_lag": {"type": "integer", "default": 3, "description": "最大滞后阶（默认 3）"},
+       "alpha": {"type": "number", "default": 0.05,
+                 "description": "条件独立检验显著性水平（默认 0.05）"}},
+      required=["data"])
+def pcmci_discover(data: dict, max_lag: int = 3, alpha: float = 0.05) -> str:
+    try:
+        from pcmci_discover import pcmci_discover as _impl
+    except ImportError as e:
+        return json.dumps({"error": f"pcmci_discover dependency missing: {e}",
+                           "hint": "pip install numpy scipy"})
+    return json.dumps(_impl(data, max_lag, alpha), ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 异质处理效应（T-learner fallback / DML 增强）
+# ═══════════════════════════════════════════════════════════════
+
+@tool("dml_cate", "异质处理效应估计（哪类标的对事件/因子反应更强）："
+      "装了 econml 时走 LinearDML（Chernozhukov et al. 2018 双重机器学习，惰性 import）；"
+      "未装时自动降级为 sklearn T-learner（处理/对照组各拟合 GradientBoostingRegressor，"
+      "预测差即 CATE，method='t_learner'）。处理变量非二元时按中位数二分并标注。"
+      "返回 JSON: {cate_summary: {mean, std, top_decile_mean, bottom_decile_mean}, "
+      "feature_importance: [{feature, importance}], method: 't_learner'|'dml', n, ...}。",
+      {"treatment": {"type": "array", "items": {"type": "number"},
+                     "description": "处理变量（事件哑变量 0/1，或因子暴露——非二元自动按中位数二分）"},
+       "outcome": {"type": "array", "items": {"type": "number"},
+                   "description": "结果变量（如事件后前瞻收益）"},
+       "features": {"type": "object",
+                    "description": "特征面板: {feature_name: [数值序列], ...}，长度与 treatment 一致",
+                    "additionalProperties": {"type": "array", "items": {"type": "number"}}}},
+      required=["treatment", "outcome", "features"])
+def dml_cate(treatment: list, outcome: list, features: dict) -> str:
+    try:
+        from dml_cate import dml_cate as _impl
+    except ImportError as e:
+        return json.dumps({"error": f"dml_cate dependency missing: {e}",
+                           "hint": "pip install numpy scikit-learn"})
+    return json.dumps(_impl(treatment, outcome, features), ensure_ascii=False)
 
 
 EXTRA_SCHEMAS: dict = {}
