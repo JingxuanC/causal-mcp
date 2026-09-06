@@ -48,6 +48,42 @@ causal:
   url: http://127.0.0.1:50057/mcp
 ```
 
+## Docker 部署
+
+无需本地 Python 环境，一条命令起服务：
+
+```bash
+docker compose up -d        # 构建镜像 + 启动容器（首次构建约 2-4 分钟）
+docker compose ps           # 查看状态
+docker compose logs -f      # 跟踪日志
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:50057/health
+curl http://127.0.0.1:50057/tools   # 应返回 8 个工具
+```
+
+license 鉴权（可选）：在 `docker-compose.yml` 中取消注释，把宿主机
+`licenses.json` 挂进容器并设置 `MCP_LICENSE_FILE`：
+
+```yaml
+environment:
+  MCP_LICENSE_FILE: /app/licenses/licenses.json
+volumes:
+  - ./licenses.json:/app/licenses/licenses.json:ro
+```
+
+可选重库（FULL 镜像）：默认镜像不含 `pycausalimpact` / `tigramite` /
+`econml`，对应工具走内置 fallback（输出 `method` 字段标注）。需要真
+BSTS / PCMCI / LinearDML 路径时：
+
+```bash
+docker compose build --build-arg FULL=true   # 或编辑 compose 中 args.FULL
+docker compose up -d
+```
+
 ## 调用示例
 
 ### event_study — 单事件研究

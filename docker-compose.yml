@@ -1,0 +1,24 @@
+services:
+  causal-mcp:
+    build:
+      context: .
+      args:
+        # FULL=true 安装可选重库（pycausalimpact/tigramite/econml），
+        # 镜像更大、构建更慢；默认 false 走内置 fallback 实现
+        FULL: "false"
+    image: causal-mcp:latest
+    container_name: causal-mcp
+    ports:
+      - "50057:50057"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # license 鉴权（可选）：设置后强制 X-License-Key
+      # MCP_LICENSE_FILE: /app/licenses/licenses.json
+      # MCP_WORKERS: "2"            # 异步任务 worker 数（默认 2）
+      # MCP_QUEUE_SIZE: "50"
+      # MCP_USAGE_DIR: /app/usage   # license 用量计数目录
+    volumes:
+      # - ./licenses.json:/app/licenses/licenses.json:ro   # license key 文件
+      # - ./usage:/app/usage                               # 用量计数持久化
+      []
+    restart: unless-stopped

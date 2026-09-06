@@ -1,0 +1,5 @@
+# 可选重库（默认镜像不装；docker compose build --build-arg FULL=true 启用）。
+# 全部惰性导入，未装时对应工具自动降级 fallback 并在 method 字段标注。
+pycausalimpact>=0.1    # causal_impact 的真 BSTS 路径
+tigramite>=5.2         # pcmci_discover 的真 PCMCI 路径
+econml>=0.15,<0.16     # dml_cate 的 LinearDML 路径；0.17 起生成的 Cython 代码要 numpy 2 头文件/运行时，与主 requirements 的 numpy<2 冲突
