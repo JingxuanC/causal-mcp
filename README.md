@@ -291,6 +291,29 @@ POST /mcp           MCP JSON-RPC（initialize / tools/list / tools/call）
 GET  /jobs/<id>     异步任务状态/结果（预留给未来的重负载工具）
 GET  /quota         license 额度余量（鉴权模式）
 GET  /queue-stats   队列概况
+GET  /metrics       Prometheus 指标（免鉴权）
+```
+
+## 可观察性 / Observability
+
+`GET /metrics` 输出 Prometheus text exposition 格式（免鉴权，仅工具名级聚合）：
+
+| 指标 | 类型 | 说明 |
+|------|------|------|
+| `mcp_tool_calls_total{tool,status}` | counter | 调用次数，status ∈ ok/error/rejected_license/rejected_quota/queued |
+| `mcp_tool_latency_seconds_sum{tool}` / `mcp_tool_latency_seconds_count{tool}` | counter | 延迟累计/次数，相除得平均延迟 |
+| `mcp_uptime_seconds` | gauge | 进程启动至今秒数 |
+| `mcp_queue_depth` | gauge | 当前排队中的异步任务数 |
+| `mcp_queue_jobs_total{status}` | counter | 已完成的异步任务数，status ∈ done/error |
+
+scrape 配置示例：
+
+```yaml
+scrape_configs:
+  - job_name: causal-mcp
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:50057"]
 ```
 
 ## 方法学说明

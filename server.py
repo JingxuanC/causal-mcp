@@ -12,6 +12,7 @@
     GET  /jobs/<id>     异步任务状态/结果（当前 8 个工具均为同步秒级，预留）
     GET  /quota         当前 license key 的额度余量（鉴权模式）
     GET  /queue-stats   队列概况
+    GET  /metrics       Prometheus 指标（免鉴权，仅工具名级聚合）
 
 鉴权与额度（mcp_gateway.py，与 factor-miner-mcp 相同）：
     环境变量 MCP_LICENSE_FILE 指向 license JSON 时强制鉴权
@@ -24,11 +25,12 @@ import argparse
 import json
 import logging
 import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from tools import EXTRA_SCHEMAS, HANDLERS, TOOLS  # noqa: F401 — 副作用：注册全部工具
 
-from mcp_gateway import JobQueue, LicenseStore, QueueFull, QuotaExceeded
+from mcp_gateway import METRICS, JobQueue, LicenseStore, QueueFull, QuotaExceeded
 
 logger = logging.getLogger("causal-mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -57,6 +59,14 @@ class CausalHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text(self, code: int, body: str, content_type: str):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _tool_schemas(self):
         schemas = [t.to_dict() for t in TOOLS.values()]
         schemas.extend(EXTRA_SCHEMAS.values())
@@ -82,6 +92,11 @@ class CausalHandler(BaseHTTPRequestHandler):
             self._send(200, self.license_store.quota_of(self._license_key()))
         elif self.path == "/queue-stats":
             self._send(200, self.job_queue.stats() if self.job_queue else {})
+        elif self.path == "/metrics":
+            # Prometheus 抓取端点，不要鉴权（只含工具名级聚合，不泄露 key）
+            depth = self.job_queue.stats()["queue_size"] if self.job_queue else None
+            self._send_text(200, METRICS.render(queue_depth=depth),
+                            "text/plain; version=0.0.4")
         elif self.path.startswith("/jobs/"):
             if not self.job_queue:
                 self._send(404, {"error": "queue disabled"})
@@ -145,6 +160,7 @@ class CausalHandler(BaseHTTPRequestHandler):
             if store and store.enabled:
                 ok, info = store.check(key)
                 if not ok:
+                    METRICS.inc_call(tool_name, "rejected_license")
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32001, "message": info}})
                     return
@@ -158,6 +174,7 @@ class CausalHandler(BaseHTTPRequestHandler):
                 try:
                     store.consume(key, heavy=bool(is_async))
                 except QuotaExceeded as e:
+                    METRICS.inc_call(tool_name, "rejected_quota")
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
@@ -169,6 +186,8 @@ class CausalHandler(BaseHTTPRequestHandler):
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32029, "message": str(e)}})
                     return
+                # 入队只记 queued；ok/error + latency 由 worker 完成时记
+                METRICS.inc_call(tool_name, "queued")
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": json.dumps({
                         "job_id": job_id, "status": "queued",
@@ -176,12 +195,17 @@ class CausalHandler(BaseHTTPRequestHandler):
                         "note": "重任务已入队，轮询 GET /jobs/<id> 拿结果",
                     }, ensure_ascii=False)}], "isError": False}})
                 return
+            t0 = time.time()
             try:
                 result = HANDLERS[tool_name](**tool_args)
+                METRICS.inc_call(tool_name, "ok")
+                METRICS.observe_latency(tool_name, time.time() - t0)
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": str(result)}], "isError": False}})
             except Exception as e:  # noqa: BLE001
                 logger.error("tool call error %s: %s", tool_name, e)
+                METRICS.inc_call(tool_name, "error")
+                METRICS.observe_latency(tool_name, time.time() - t0)
                 self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}})
             return
