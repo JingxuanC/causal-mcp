@@ -1,8 +1,12 @@
 # FULL=true 时安装可选重库（pycausalimpact / tigramite / econml），
 # 对应工具走真 BSTS / PCMCI / LinearDML 路径；默认保持苗条镜像。
 ARG FULL=false
+# 国内构建加速：--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+# （作用于所有 build stage 的 pip/pip wheel）
+ARG PIP_INDEX_URL
 
 FROM python:3.11-slim AS runtime-base
+ARG PIP_INDEX_URL
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -17,6 +21,7 @@ RUN pip install -r requirements.txt
 # 用 python:3.11 完整镜像（自带编译工具链）打 wheel，再拷回 slim，
 # 避免在 slim 里 apt 安装 build-essential
 FROM python:3.11 AS wheels
+ARG PIP_INDEX_URL
 COPY requirements-full.txt ./
 # econml 预生成的 Cython .c 基于 numpy 1.x API，build isolation 会拉
 # numpy 2.x 头文件导致编译失败；固定 numpy<2 + 关闭隔离（与运行时
