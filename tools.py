@@ -51,7 +51,7 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
         TOOLS[name] = ToolDef(name, description, {
             "type": "object",
             "properties": properties,
-            "required": required or list(properties.keys()),
+            "required": required or [],
         })
         HANDLERS[name] = fn
         return fn
@@ -74,12 +74,15 @@ _EVENT_PROPS = {
                   "description": "市场基准（指数）日K线，与 klines 等长；缺失/不等长时按零收益处理"},
     "sector_benchmark": {**_KLINES_SCHEMA,
                          "description": "可选：板块基准日K线，提供后启用多因子模型（市场+板块）"},
+    "alpha": {"type": "number", "default": 0.05,
+              "description": "显著性水平（默认 0.05），用于 is_significant 与 confidence；"
+                             "生效阈值回显在 alpha_threshold 字段"},
 }
 
 _EVENT_RESULT_DOC = (
-    "返回 JSON: {car_1d, car_3d, car_5d, car_pre1d, alpha, beta_market[, beta_sector], "
-    "r_squared, sigma, t_stat, p_value, is_significant, direction, impact_score, "
-    "confidence, status}。status != 'ok' 时其余字段为零值占位。"
+    "返回 JSON: {car_1d, car_3d, car_5d, car_pre1d, alpha(回归截距), beta_market[, beta_sector], "
+    "r_squared, sigma, t_stat, p_value, is_significant, alpha_threshold(显著性阈值), direction, "
+    "impact_score, confidence, status}。status != 'ok' 时其余字段为零值占位。"
 )
 
 
@@ -94,10 +97,11 @@ _EVENT_RESULT_DOC = (
       required=["symbol", "event_date", "klines"])
 def event_study(symbol: str, event_date: str, klines: list,
                 benchmark: Optional[list] = None,
-                sector_benchmark: Optional[list] = None) -> str:
+                sector_benchmark: Optional[list] = None,
+                alpha: float = 0.05) -> str:
     from event_study_batch import process_batch
     evt = {"event_id": 1, "symbol": symbol, "event_date": event_date,
-           "klines": klines, "benchmark": benchmark or []}
+           "klines": klines, "benchmark": benchmark or [], "alpha": alpha}
     if sector_benchmark:
         evt["sector_benchmark"] = sector_benchmark
     result = process_batch({"events": [evt]})["results"][0]
@@ -109,7 +113,8 @@ def event_study(symbol: str, event_date: str, klines: list,
       "stdout JSON），与 Athena Go causal engine 的调用方式一致。"
       "每个事件返回字段同 event_study，另带 event_id/symbol/event_date 回显。",
       {"events": {"type": "array",
-                  "description": "事件列表: [{event_id, symbol, event_date, klines, benchmark?, sector_benchmark?}, ...]",
+                  "description": "事件列表: [{event_id, symbol, event_date, klines, benchmark?, "
+                                 "sector_benchmark?, alpha?}, ...]（alpha 默认 0.05）",
                   "items": {"type": "object"}},
        "timeout": {"type": "integer", "description": "子进程超时秒数（默认 120）", "default": 120}},
       required=["events"])

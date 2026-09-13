@@ -10,7 +10,7 @@ from scipy import stats
 
 def market_model_car(stock_returns, market_returns, event_idx,
                      est_window=(-60, -6), car_windows=[(0, 1), (0, 3), (0, 5)],
-                     sector_returns=None):
+                     sector_returns=None, alpha: float = 0.05):
     """
     Compute CAR using market model or multi-factor regression.
 
@@ -21,9 +21,11 @@ def market_model_car(stock_returns, market_returns, event_idx,
         est_window: (start_offset, end_offset) relative to event_idx
         car_windows: list of (start, end) tuples for CAR computation
         sector_returns: optional array-like, sector benchmark returns
+        alpha: float, 显著性水平（默认 0.05），用于 is_significant 与 confidence
 
     Returns:
-        dict with car values, t-stat, p-value, alpha, betas, r_squared
+        dict with car values, t-stat, p-value, alpha(回归截距)/alpha_threshold(显著性阈值),
+              betas, r_squared
     """
     n = len(stock_returns)
     est_start = max(0, event_idx + est_window[0])
@@ -112,10 +114,11 @@ def market_model_car(stock_returns, market_returns, event_idx,
         "sigma": round(float(sigma), 6),
         "t_stat": round(float(t_stat), 4),
         "p_value": round(float(p_value), 4),
-        "is_significant": bool(p_value < 0.20),
+        "is_significant": bool(p_value < alpha),
+        "alpha_threshold": round(float(alpha), 4),
         "direction": direction,
         "impact_score": round(float(impact), 4),
-        "confidence": round(float(_confidence(p_value, r_squared)), 4),
+        "confidence": round(float(_confidence(p_value, r_squared, alpha)), 4),
         "status": "ok",
     }
 
@@ -140,18 +143,19 @@ def _primary_window_days(windows, primary_key="car_1d"):
     return 1
 
 
-def _empty_result(reason):
+def _empty_result(reason, alpha: float = 0.05):
     return {
         "car_1d": 0, "car_3d": 0, "car_5d": 0, "car_pre1d": 0,
         "alpha": 0, "r_squared": 0, "sigma": 0,
         "t_stat": 0, "p_value": 1.0, "is_significant": False,
+        "alpha_threshold": round(float(alpha), 4),
         "direction": "N/A", "impact_score": 0, "confidence": 0,
         "status": reason,
     }
 
 
-def _confidence(p_value, r_squared):
-    sig_score = max(0, 1 - p_value / 0.20)
+def _confidence(p_value, r_squared, alpha: float = 0.05):
+    sig_score = max(0, 1 - p_value / alpha) if alpha > 0 else 0.0
     fit_score = max(0, min(1, r_squared / 0.3))
     return sig_score * 0.7 + fit_score * 0.3
 

@@ -44,11 +44,24 @@ def refute_placebo(car_series: np.ndarray) -> dict:
         return {"method": "placebo_treatment", "result": "skipped",
                 "interpretation": "Not enough data for placebo test"}
 
+    # Placebo 窗口必须与真实处理窗口（car_series[:3]）错开：起点从 1 开始，
+    # 否则 idx=0 时 placebo 窗口就是真实窗口，安慰剂效应等于真效应 → 恒 refuted
+    n = len(car_series)
+    max_start = n - 3
+    if max_start < 1:
+        return {"method": "placebo_treatment", "result": "skipped",
+                "interpretation": "Series too short for a non-overlapping placebo window"}
+    if max_start == 1:
+        # 只有 idx=1 一个可用位置，构不成分布 → 无法做安慰剂检验，诚实跳过
+        return {"method": "placebo_treatment", "result": "skipped",
+                "interpretation": "Only one non-overlapping placebo window available; "
+                                  "no placebo distribution to test against"}
+
     # Simulate 100 random treatment assignments
     np.random.seed(42)
     placebo_cars = []
     for _ in range(100):
-        idx = np.random.choice(len(car_series) - 3)  # need 3 post-days
+        idx = np.random.choice(np.arange(1, max_start + 1))  # 排除与真实窗口重合的 0
         placebo_cars.append(np.mean(car_series[idx:idx + 3]))
 
     true_car = np.mean(car_series[:3])  # first 3 days = actual treatment window
@@ -138,6 +151,10 @@ def grade_refutation(refutations: list) -> tuple:
     if total == 0:
         return "N/A", "All tests skipped (insufficient data)"
 
+    # 只有 1 个测试跑过时评级没有统计意义：按比例会给 F，误导为"结论是伪相关"
+    if total < 2:
+        return "N/A", "Not enough refutation tests completed (need >= 2)"
+
     robust_ratio = robust / total
     if robust_ratio >= 0.8 and refuted == 0:
         return "A", "Strong evidence: all refutation tests passed"
@@ -149,6 +166,25 @@ def grade_refutation(refutations: list) -> tuple:
         return "D", "Poor evidence: most tests failed, likely spurious correlation"
     else:
         return "F", "Failed: all refutation tests indicate spurious correlation"
+
+
+def _summarize_tests(results: list, n_series: int) -> str:
+    """说明本次实际执行了几个 refuter、跳过了几个以及跳过原因。
+
+    让调用方（LLM）知道评级是基于几个测试得出的，避免把"只跑了 1 个测试"
+    误读成"结论已被全面验证"。
+    """
+    total = len(results)
+    skipped = [r for r in results if r["result"] == "skipped"]
+    executed = [r for r in results if r["result"] in ("robust", "refuted")]
+    if not skipped:
+        return (f"{len(executed)} of {total} refuters completed "
+                f"(series length {n_series}, no test skipped)")
+    detail = "; ".join(f"{r['method']}: {r.get('interpretation', 'skipped')}"
+                       for r in skipped)
+    return (f"{len(skipped)} of {total} refuters skipped: insufficient series length "
+            f"(got {n_series}, need placebo>=5, random_common_cause>=10, data_subset>=8); "
+            f"{len(executed)} executed [skipped — {detail}]")
 
 
 def refute_causal_chain(chain: dict) -> dict:
@@ -180,7 +216,8 @@ def refute_causal_chain(chain: dict) -> dict:
             "refutations": [{"method": "all", "result": "skipped",
                              "interpretation": "CAR too small to refute meaningfully"}],
             "passed": 0, "failed": 0, "grade": "N/A",
-            "recommendation": "Event impact is negligible; no causal claim"
+            "recommendation": "Event impact is negligible; no causal claim",
+            "notes": "0 of 3 refuters executed: CAR too small to refute meaningfully"
         }
 
     results.append(refute_placebo(car_series))
@@ -197,6 +234,7 @@ def refute_causal_chain(chain: dict) -> dict:
         "failed": failed,
         "grade": grade,
         "recommendation": rec,
+        "notes": _summarize_tests(results, len(car_series)),
         "p_value_original": p_value if p_value < 1 else None,
     }
 
