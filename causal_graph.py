@@ -83,6 +83,9 @@ def pc_algorithm(data: np.ndarray, columns: list, alpha: float = 0.05) -> dict:
         adj[i].add(j)
         adj[j].add(i)
 
+    # sepset[(i,j)] = 使 i ⟂ j | S 成立的条件集 S（PC 定向阶段要用）
+    sepsets = {}
+
     max_cond = min(n_vars - 2, 3)  # limit conditioning set size
 
     for k in range(max_cond + 1):
@@ -110,28 +113,68 @@ def pc_algorithm(data: np.ndarray, columns: list, alpha: float = 0.05) -> dict:
                             edges.discard((min(i, j), max(i, j)))
                             adj[i].discard(j)
                             adj[j].discard(i)
+                            sepsets[(min(i, j), max(i, j))] = frozenset(cond_list)
                             changed = True
                             break
+
+    # ── 定向：只做 PC 算法中统计上合法的那一步 —— v-structure ──────────
+    # 若 i - k - j 且 i、j 不相邻（unshielded），并且 k ∉ sepset(i,j)，
+    # 则唯一相容的定向是 i → k ← j（对撞结构）。其余边保持无向。
+    # 旧实现按 |corr| > 0.1 就画箭头，那是把「相关强度」当成「因果方向」，
+    # 在纯观测数据上是无依据的（Markov 等价类内所有定向都同样拟合数据）。
+    directed = set()   # (a, b) 表示 a → b
+    v_structures = []
+    for k in range(n_vars):
+        nbrs = sorted(adj[k])
+        for a_idx in range(len(nbrs)):
+            for b_idx in range(a_idx + 1, len(nbrs)):
+                i, j = nbrs[a_idx], nbrs[b_idx]
+                if j in adj[i] or i in adj[j]:
+                    continue  # i、j 仍有边相连 → 不是 unshielded
+                ss = sepsets.get((min(i, j), max(i, j)))
+                if ss is None or k in ss:
+                    continue
+                directed.add((i, k))
+                directed.add((j, k))
+                v_structures.append({
+                    "collider": columns[k],
+                    "parents": [columns[i], columns[j]],
+                    "sepset": sorted(columns[c] for c in ss),
+                })
 
     # Build result
     result_edges = []
     for (i, j) in edges:
         corr = float(np.corrcoef(data[:, i], data[:, j])[0, 1])
-        # Determine direction by correlation sign
-        direction = "→" if abs(corr) > 0.1 else "—"
+        if (i, j) in directed:
+            src, dst, orientation = i, j, "v_structure"
+        elif (j, i) in directed:
+            src, dst, orientation = j, i, "v_structure"
+        else:
+            src, dst, orientation = i, j, "undirected"
         result_edges.append({
-            "from": columns[i],
-            "to": columns[j],
+            "from": columns[src],
+            "to": columns[dst],
             "weight": round(abs(corr) if not np.isnan(corr) else 0, 4),
             "correlation": round(float(corr) if not np.isnan(corr) else 0, 4),
-            "direction": direction,
+            "direction": "→" if orientation == "v_structure" else "—",
+            "orientation": orientation,
         })
+
+    n_oriented = sum(1 for e in result_edges if e["orientation"] == "v_structure")
+    n_undirected = len(result_edges) - n_oriented
 
     return {
         "edges": sorted(result_edges, key=lambda e: e["weight"], reverse=True),
         "nodes": columns,
         "method": "pc",
         "alpha": alpha,
+        "v_structures": v_structures,
+        "caveat": (
+            "PC 输出的是 Markov 等价类：只有对撞结构（v-structure）可以定向，"
+            "其余 %d 条无向边在观测数据下无法区分方向。若需要方向性结论，"
+            "请改用带时间的序列方法（granger_te 的 lead-lag / 事件研究）。"
+        ) % n_undirected,
     }
 
 
@@ -175,6 +218,10 @@ def note_ars_algorithm(data: np.ndarray, columns: list, lambda1: float = 0.1) ->
         "edges": sorted(edges, key=lambda e: e["weight"], reverse=True),
         "nodes": columns,
         "method": "notears_ridge",
+        "caveat": (
+            "简化版 NOTEARS（Ridge 回归 + 阈值），不是原论文的带约束优化，"
+            "得到的 from→to 是回归可解释性排序，不等价于已识别的因果方向。"
+        ),
     }
 
 
@@ -200,9 +247,12 @@ def learn_graph(body: dict) -> dict:
     n_edges = len(result["edges"])
     n_possible = len(columns) * (len(columns) - 1) // 2
     weights = [e["weight"] for e in result["edges"]]
+    n_oriented = sum(1 for e in result["edges"] if e.get("orientation") == "v_structure")
 
     result["metrics"] = {
         "n_edges": n_edges,
+        "n_oriented": n_oriented,
+        "n_undirected": n_edges - n_oriented,
         "sparsity": round(1 - n_edges / max(n_possible, 1), 4),
         "avg_weight": round(float(np.mean(weights)) if weights else 0, 4),
     }

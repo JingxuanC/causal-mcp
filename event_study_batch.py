@@ -44,18 +44,32 @@ def process_batch(data):
         ret_dates = dates[1:]
 
         # Market benchmark returns
-        bench_closes = np.array([b["close"] for b in (evt.get("benchmark") or [])], dtype=float)
-        if len(bench_closes) != len(closes):
-            market_ret = np.zeros(len(stock_ret))
+        # benchmark 缺失/长度不匹配时**不再**填零跑 OLS（P1 修复点）：
+        # 含零列的 lstsq 不报错，会静默退化成常数均值模型却仍报 r_squared。
+        # 这里传 None 并带上状态，由 event_study 降级为 raw_excess_return 并标注。
+        raw_bench = evt.get("benchmark") or []
+        bench_closes = np.array([b["close"] for b in raw_bench], dtype=float)
+        benchmark_status = "ok"
+        market_ret = None
+        if len(bench_closes) == 0:
+            benchmark_status = "missing"
+        elif len(bench_closes) != len(closes):
+            benchmark_status = "length_mismatch"
+        elif len(bench_closes) < 2:
+            benchmark_status = "too_short"
         else:
             market_ret = np.diff(np.log(bench_closes))
 
-        # Sector benchmark returns (if provided)
+        # Sector benchmark returns (if provided): 长度不匹配时明确标注，不再静默丢弃
         sector_ret = None
+        sector_status = "not_provided"
         if evt.get("sector_benchmark"):
             sb = np.array([b["close"] for b in evt["sector_benchmark"]], dtype=float)
-            if len(sb) == len(closes):
+            if len(sb) == len(closes) and len(sb) >= 2:
                 sector_ret = np.diff(np.log(sb))
+                sector_status = "ok"
+            else:
+                sector_status = "dropped_length_mismatch"
 
         # 显著性水平（默认 0.05，可被单事件覆盖）
         alpha = float(evt.get("alpha", 0.05))
@@ -77,6 +91,8 @@ def process_batch(data):
             result["event_id"] = evt["event_id"]
             result["symbol"] = sym
             result["event_date"] = event_date
+            result["benchmark_status"] = benchmark_status
+            result["sector_status"] = sector_status
             results.append(result)
             continue
 
@@ -86,7 +102,11 @@ def process_batch(data):
             event_idx=event_idx,
             sector_returns=sector_ret,
             alpha=alpha,
+            benchmark_status=benchmark_status,
         )
+        # 批量层掌握的 sector 状态更权威（长度不匹配在此被拦下，未传入函数）
+        if sector_status != "not_provided":
+            result["sector_status"] = sector_status
         result["event_id"] = evt["event_id"]
         result["symbol"] = sym
         result["event_date"] = event_date
