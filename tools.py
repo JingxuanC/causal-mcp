@@ -25,7 +25,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import panel
 
@@ -136,11 +136,12 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
 
 
 _KLINES_SCHEMA = {
-    "type": "array",
-    "description": "日K线（按日期升序）: [{date: 'YYYY-MM-DD', close: number}, ...]",
-    "items": {"type": "object",
-              "properties": {"date": {"type": "string"}, "close": {"type": "number"}},
-              "required": ["date", "close"]},
+    # 形状容差：既接受扁平 bar 数组，也接受 {symbol:[bars]} / {columns,rows} /
+    # 宽表 / 长表（panel.py 契约）。注解侧也必须放宽 —— 网关按**函数注解**
+    # 校验，见 mcp_common._ann_type。
+    "anyOf": [{"type": "array"}, {"type": "object"}],
+    "description": "日K线（按日期升序）或等价面板形状（panel.py 契约）: 原生 "
+                   "[{date: 'YYYY-MM-DD', close: number}, ...]",
 }
 
 _EVENT_PROPS = {
@@ -276,8 +277,8 @@ def refute(chain: dict) -> str:
       "method='notears'：简化 NOTEARS（Ridge 回归识别父节点，未装 sklearn 时降级为相关性）。"
       "返回 JSON: {edges: [{from, to, weight, direction}], nodes, method, "
       "metrics: {n_edges, sparsity, avg_weight}}。",
-      {"data": {"type": "object",
-                "description": "表格数据: {columns: ['sh600519', ...], rows: [[1700, ...], ...], dates?: [...]}",
+      {"data": {"anyOf": [{"type": "object"}, {"type": "array"}],
+                "description": "表格数据（也接受 bar 数组/长表，panel.py 契约）: {columns: ['sh600519', ...], rows: [[1700, ...], ...], dates?: [...]}",
                 "properties": {
                     "columns": {"type": "array", "items": {"type": "string"}},
                     "rows": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
@@ -289,7 +290,7 @@ def refute(chain: dict) -> str:
        "alpha": {"type": "number", "default": 0.05,
                  "description": "PC 算法条件独立性检验显著性水平（默认 0.05）"}},
       required=["data"])
-def learn_graph(data: dict, method: str = "pc", alpha: float = 0.05) -> str:
+def learn_graph(data: Any, method: str = "pc", alpha: float = 0.05) -> str:
     data, err = _norm_matrix(data, "data")
     if err:
         return err
@@ -386,7 +387,7 @@ def granger_te(x, y=None, max_lag: int = 5) -> str:
        "alpha": {"type": "number", "default": 0.05,
                  "description": "条件独立检验显著性水平（默认 0.05）"}},
       required=["data"])
-def pcmci_discover(data: dict, max_lag: int = 3, alpha: float = 0.05) -> str:
+def pcmci_discover(data: Any, max_lag: int = 3, alpha: float = 0.05) -> str:
     data, err = _norm_matrix(data, "data")
     if err:
         return err
@@ -408,15 +409,19 @@ def pcmci_discover(data: dict, max_lag: int = 3, alpha: float = 0.05) -> str:
       "预测差即 CATE，method='t_learner'）。处理变量非二元时按中位数二分并标注。"
       "返回 JSON: {cate_summary: {mean, std, top_decile_mean, bottom_decile_mean}, "
       "feature_importance: [{feature, importance}], method: 't_learner'|'dml', n, ...}。",
-      {"treatment": {"type": "array", "items": {"type": "number"},
+      {"treatment": {**_KLINES_SCHEMA,
+                     "description": "处理变量（事件哑变量 0/1，或因子暴露——非二元自动按中位数二分）",
+                     "items": {"type": "number"},
                      "description": "处理变量（事件哑变量 0/1，或因子暴露——非二元自动按中位数二分）"},
-       "outcome": {"type": "array", "items": {"type": "number"},
+       "outcome": {**_KLINES_SCHEMA,
+                   "description": "结果变量（如事件后前瞻收益）",
+                   "items": {"type": "number"},
                    "description": "结果变量（如事件后前瞻收益）"},
-       "features": {"type": "object",
+       "features": {"anyOf": [{"type": "object"}, {"type": "array"}],
                     "description": "特征面板: {feature_name: [数值序列], ...}，长度与 treatment 一致",
                     "additionalProperties": {"type": "array", "items": {"type": "number"}}}},
       required=["treatment", "outcome", "features"])
-def dml_cate(treatment: list, outcome: list, features: dict) -> str:
+def dml_cate(treatment: Any, outcome: Any, features: Any) -> str:
     treatment, err = _norm_values(treatment, "treatment")
     if err:
         return err
@@ -436,3 +441,12 @@ def dml_cate(treatment: list, outcome: list, features: dict) -> str:
 
 
 EXTRA_SCHEMAS: dict = {}
+
+
+# 形状容差参数清单：(工具名, 参数名) —— 供测试钉住网关层的注解放宽。
+SHAPE_TOLERANT_ARGS = [
+    ("event_study", "klines"), ("event_study", "benchmark"),
+    ("causal_impact", "klines"), ("granger_te", "x"), ("granger_te", "y"),
+    ("learn_graph", "data"), ("pcmci_discover", "data"),
+    ("dml_cate", "treatment"), ("dml_cate", "outcome"), ("dml_cate", "features"),
+]
