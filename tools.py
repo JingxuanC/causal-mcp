@@ -27,7 +27,84 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import panel
+
 _HERE = Path(__file__).resolve().parent
+
+
+# ═══════════════════════════════════════════════════════════════
+# 入参归一化（统一 panel 契约，见 panel.py）
+# 2026-09-15：此前 klines 只吃扁平 bar 数组、data 只吃 {columns,rows}、
+# features 只吃 {name:[...]}，且形状错误时抛出的是 pandas/内部异常而非
+# 可自诊断的 JSON。现在全部统一收口到 panel。
+# ═══════════════════════════════════════════════════════════════
+
+def _shape_error(field: str, exc: Exception) -> str:
+    return json.dumps({"error": "%s 无法解析: %s" % (field, exc)}, ensure_ascii=False)
+
+
+def _norm_bars(obj, field: str = "klines"):
+    """任意受支持形状 → 标准 bar 列表。返回 ``(bars, None)`` 或 ``(None, 错误JSON)``。"""
+    try:
+        return panel.as_bars(obj), None
+    except panel.PanelError as e:
+        return None, _shape_error(field, e)
+
+
+def _norm_values(obj, field: str):
+    """任意受支持形状 → 纯数值序列（granger/dml 的 x/y/treatment/outcome）。"""
+    if isinstance(obj, (list, tuple)) and all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) for v in obj
+    ):
+        return [float(v) for v in obj], None
+    try:
+        return [float(r["value"]) for r in panel.as_series(obj, key="close")], None
+    except panel.PanelError as e:
+        return None, _shape_error(field, e)
+
+
+def _norm_xy(x, y):
+    """x/y 任意形状；``y`` 缺省且 ``x`` 是多序列 dict 时自动取前两列。
+
+    这样 ``granger_te({symA: bars, symB: bars})`` 就能直接用，
+    不必先把两个序列拆成单独的数组。
+    """
+    if y is None and isinstance(x, dict):
+        syms = [k for k in x if isinstance(x[k], (list, tuple)) and x[k]]
+        if len(syms) >= 2:
+            a, err = _norm_values({syms[0]: x[syms[0]]}, "x")
+            if err:
+                raise panel.PanelError(err)
+            b, err = _norm_values({syms[1]: x[syms[1]]}, "y")
+            if err:
+                raise panel.PanelError(err)
+            return a, b
+    a, err = _norm_values(x, "x")
+    if err:
+        raise panel.PanelError(err)
+    b, err = _norm_values(y, "y")
+    if err:
+        raise panel.PanelError(err)
+    return a, b
+
+
+def _norm_matrix(data, field: str = "data"):
+    """任意受支持形状 → ``{columns, rows}`` 矩阵（因果图工具用）。
+
+    已经是 ``{columns, rows}`` 的输入原样通过 —— 那种矩阵未必有 date/close 列，
+    不能丢给 as_dataframe 去要求日期列。
+    """
+    if isinstance(data, dict) and "columns" in data and "rows" in data:
+        # 只有**纯数值列**才是原生矩阵；含 date/symbol 列说明这是长表或
+        # 「日期+标的」面板，必须走归一化，否则日期字符串会进 rows 让
+        # np.asarray(..., dtype=float) 崩掉（2026-09-15 实测）。
+        if not (panel.present_fields(data) & {"date", "symbol"}):
+            return data, None
+    try:
+        cols, rows, dates = panel.as_matrix(data, with_dates=True)
+        return {"columns": cols, "rows": rows, "dates": dates}, None
+    except panel.PanelError as e:
+        return None, _shape_error(field, e)
 
 
 # ── Toolkit interface ──
@@ -95,10 +172,21 @@ _EVENT_RESULT_DOC = (
       + _EVENT_RESULT_DOC,
       _EVENT_PROPS,
       required=["symbol", "event_date", "klines"])
-def event_study(symbol: str, event_date: str, klines: list,
-                benchmark: Optional[list] = None,
-                sector_benchmark: Optional[list] = None,
+def event_study(symbol: str, event_date: str, klines,
+                benchmark=None,
+                sector_benchmark=None,
                 alpha: float = 0.05) -> str:
+    klines, err = _norm_bars(klines)
+    if err:
+        return err
+    if benchmark:
+        benchmark, err = _norm_bars(benchmark, "benchmark")
+        if err:
+            return err
+    if sector_benchmark:
+        sector_benchmark, err = _norm_bars(sector_benchmark, "sector_benchmark")
+        if err:
+            return err
     from event_study_batch import process_batch
     evt = {"event_id": 1, "symbol": symbol, "event_date": event_date,
            "klines": klines, "benchmark": benchmark or [], "alpha": alpha}
@@ -119,7 +207,21 @@ def event_study(symbol: str, event_date: str, klines: list,
        "timeout": {"type": "integer", "description": "子进程超时秒数（默认 120）", "default": 120}},
       required=["events"])
 def event_study_batch(events: list, timeout: int = 120) -> str:
-    payload = json.dumps({"events": events}, ensure_ascii=False)
+    fixed = []
+    for i, ev in enumerate(events or []):
+        ev = dict(ev)
+        if ev.get("klines"):
+            bars, err = _norm_bars(ev["klines"], "events[%d].klines" % i)
+            if err:
+                return err
+            ev["klines"] = bars
+        if ev.get("benchmark"):
+            bars, err = _norm_bars(ev["benchmark"], "events[%d].benchmark" % i)
+            if err:
+                return err
+            ev["benchmark"] = bars
+        fixed.append(ev)
+    payload = json.dumps({"events": fixed}, ensure_ascii=False)
     try:
         proc = subprocess.run(
             [sys.executable, str(_HERE / "event_study_batch.py")],
@@ -188,6 +290,9 @@ def refute(chain: dict) -> str:
                  "description": "PC 算法条件独立性检验显著性水平（默认 0.05）"}},
       required=["data"])
 def learn_graph(data: dict, method: str = "pc", alpha: float = 0.05) -> str:
+    data, err = _norm_matrix(data, "data")
+    if err:
+        return err
     try:
         from causal_graph import learn_graph as _impl
     except ImportError as e:
@@ -213,8 +318,15 @@ def learn_graph(data: dict, method: str = "pc", alpha: float = 0.05) -> str:
        "benchmark": {**_KLINES_SCHEMA,
                      "description": "市场基准（指数）日K线，与 klines 对齐；缺失按零收益处理"}},
       required=["symbol", "event_date", "klines"])
-def causal_impact(symbol: str, event_date: str, klines: list,
-                  benchmark: Optional[list] = None) -> str:
+def causal_impact(symbol: str, event_date: str, klines,
+                  benchmark=None) -> str:
+    klines, err = _norm_bars(klines)
+    if err:
+        return err
+    if benchmark:
+        benchmark, err = _norm_bars(benchmark, "benchmark")
+        if err:
+            return err
     try:
         from causal_impact import causal_impact as _impl
     except ImportError as e:
@@ -234,12 +346,17 @@ def causal_impact(symbol: str, event_date: str, klines: list,
       "'x_leads'|'y_leads'|'none'}。依赖 statsmodels（requirements 必需项）。",
       {"x": {"type": "array", "items": {"type": "number"},
              "description": "序列 X（如基准/领先者收益率，按时间升序）"},
-       "y": {"type": "array", "items": {"type": "number"},
-             "description": "序列 Y（与 X 等长）"},
+       "y": {"type": "array",
+             "description": "序列 Y（与 X 等长）。**可省略** —— 省略且 x 是多标的 dict "
+                            "时自动取前两个标的的收益率"},
        "max_lag": {"type": "integer", "default": 5,
                    "description": "最大滞后阶（默认 5）"}},
-      required=["x", "y"])
-def granger_te(x: list, y: list, max_lag: int = 5) -> str:
+      required=["x"])
+def granger_te(x, y=None, max_lag: int = 5) -> str:
+    try:
+        x, y = _norm_xy(x, y)
+    except panel.PanelError as e:
+        return _shape_error("x/y", e)
     try:
         from granger_te import granger_te as _impl
     except ImportError as e:
@@ -270,6 +387,9 @@ def granger_te(x: list, y: list, max_lag: int = 5) -> str:
                  "description": "条件独立检验显著性水平（默认 0.05）"}},
       required=["data"])
 def pcmci_discover(data: dict, max_lag: int = 3, alpha: float = 0.05) -> str:
+    data, err = _norm_matrix(data, "data")
+    if err:
+        return err
     try:
         from pcmci_discover import pcmci_discover as _impl
     except ImportError as e:
@@ -297,6 +417,16 @@ def pcmci_discover(data: dict, max_lag: int = 3, alpha: float = 0.05) -> str:
                     "additionalProperties": {"type": "array", "items": {"type": "number"}}}},
       required=["treatment", "outcome", "features"])
 def dml_cate(treatment: list, outcome: list, features: dict) -> str:
+    treatment, err = _norm_values(treatment, "treatment")
+    if err:
+        return err
+    outcome, err = _norm_values(outcome, "outcome")
+    if err:
+        return err
+    try:
+        features = panel.as_features(features)
+    except panel.PanelError as e:
+        return _shape_error("features", e)
     try:
         from dml_cate import dml_cate as _impl
     except ImportError as e:
